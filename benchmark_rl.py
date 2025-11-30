@@ -232,8 +232,9 @@ class RLOptimizer:
 # -----------------------------------------------------------------------------
 
 class RandomSearchOptimizer:
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, rng: np.random.Generator = None):
         self.dim = dim
+        self.rng = rng if rng is not None else np.random.default_rng()
 
     def suggest(
         self,
@@ -243,7 +244,7 @@ class RandomSearchOptimizer:
         step: int,
         budget: int,
     ) -> np.ndarray:
-        return np.random.rand(self.dim)
+        return self.rng.random(self.dim)
 
 
 # -----------------------------------------------------------------------------
@@ -496,10 +497,13 @@ def run_benchmarks():
                 for rep in range(REPETITIONS):
                     print(f"  Repetition {rep+1}/{REPETITIONS}...")
 
-                    rng = np.random.default_rng(seed=1234 + rep)
+                    # Use same seed for all algorithms to ensure fair comparison
+                    # (each gets same initial random points)
+                    seed = 1234 + rep
 
                     # --- Random Search ---
-                    rs_opt = RandomSearchOptimizer(dim=dim)
+                    rs_rng = np.random.default_rng(seed=seed)
+                    rs_opt = RandomSearchOptimizer(dim=dim, rng=rs_rng)
                     rs_hist = run_single_algorithm(
                         problem=problem,
                         dim=dim,
@@ -507,7 +511,7 @@ def run_benchmarks():
                         optimizer_obj=rs_opt,
                         budget=budget,
                         n_init=n_init,
-                        rng=rng,
+                        rng=rs_rng,
                     )
 
                     for t, bf in enumerate(rs_hist["best_feasible"]):
@@ -532,7 +536,7 @@ def run_benchmarks():
                         optimizer_obj=qlogei_opt,
                         budget=budget,
                         n_init=n_init,
-                        rng=rng,
+                        rng=np.random.default_rng(seed=seed),
                     )
 
                     for t, bf in enumerate(q_hist["best_feasible"]):
@@ -562,7 +566,7 @@ def run_benchmarks():
                             optimizer_obj=rl_opt,
                             budget=budget,
                             n_init=n_init,
-                            rng=rng,
+                            rng=np.random.default_rng(seed=seed),
                         )
 
                         for t, bf in enumerate(rl_hist["best_feasible"]):
