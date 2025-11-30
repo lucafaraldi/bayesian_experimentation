@@ -121,8 +121,12 @@ class RLOptimizer:
         # (train_rl.py saved this as "state_dim")
         self.state_dim = int(ckpt.get("state_dim"))
 
+        # Extract hidden_dim from the checkpoint by inspecting the layer shapes
+        # The first layer weight has shape [hidden_dim, state_dim]
+        hidden_dim = int(ckpt["policy_state_dict"]["shared.0.weight"].shape[0])
+
         # Build the same architecture and load only the policy weights
-        self.policy = PolicyNetwork(self.state_dim, dim).to(DEVICE)
+        self.policy = PolicyNetwork(self.state_dim, dim, hidden_dim=hidden_dim).to(DEVICE)
         self.policy.load_state_dict(ckpt["policy_state_dict"])
         self.policy.eval()
 
