@@ -1,15 +1,12 @@
 #!/usr/bin/env python
 """
-Benchmark pre-trained RL policies against qLogEI and Random Search
-on the COCO bbob-constrained suite, as in the BO practical assignment.
+Benchmark FULL COCO pre-trained RL policies against qLogEI and Random Search.
 
-- Problems: F2, F4, F6, F50, F52, F54
-- Instances: 0, 1, 2
-- Dimensions: 2, 10
-- Budget: 10 * dim evals
-- Repetitions: 5
-
-Outputs: a CSV with per-evaluation best feasible value for each method.
+This version works with policies trained by train_rl_full_coco.py which have:
+- Enhanced state representation (16 summary + 3 surrogate + 2*dim)
+- Trained on ALL COCO functions (not just 6)
+- Trained on more instances (1-5 instead of 1-3)
+- Should generalize better to unseen problems
 """
 
 import os
@@ -23,7 +20,7 @@ import pandas as pd
 import torch
 from torch import nn
 
-import cocoex  # pip install cocoex
+import cocoex
 
 # BoTorch setup (qLogEI baseline)
 from botorch.models import SingleTaskGP, ModelListGP
@@ -37,10 +34,7 @@ import warnings
 from gpytorch.utils.warnings import NumericalWarning
 from botorch.exceptions.warnings import OptimizationWarning
 
-# Silence GP noise-floor spam
 warnings.filterwarnings("ignore", category=NumericalWarning)
-
-# Silence BoTorch's scipy-optimizer spam
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="Optimization failed in `gen_candidates_scipy`.*")
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="Optimization failed on the second try.*")
 warnings.filterwarnings("ignore", category=OptimizationWarning)
@@ -51,29 +45,28 @@ warnings.filterwarnings("ignore", category=OptimizationWarning)
 
 FUNCTIONS = [2, 4, 6, 50, 52, 54]
 INSTANCES = [1, 2, 3]
-DIMENSIONS = [2, 10]  # extend to 40 if you manage RL there
+DIMENSIONS = [2, 10]
 REPETITIONS = 5
-BUDGET_FACTOR = 10   # evals = BUDGET_FACTOR * dim
-N_INIT_FACTOR = 2    # initial random design = N_INIT_FACTOR * dim
+BUDGET_FACTOR = 10
+N_INIT_FACTOR = 2
 
-# Where your trained RL policies live
 MODEL_DIR = Path("models")
-MODEL_PATTERN = "coco_policy_dim{dim}.pt"
+MODEL_PATTERN = "coco_policy_full_dim{dim}.pt"
 
-OUT_CSV = Path("results_coco_rl_vs_qlogei.csv")
-OUT_CSV_SUMMARY = Path("results_coco_rl_vs_qlogei_summary.csv")
+OUT_CSV = Path("results_coco_rl_full_vs_qlogei.csv")
+OUT_CSV_SUMMARY = Path("results_coco_rl_full_vs_qlogei_summary.csv")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DTYPE = torch.double  # BoTorch prefers double
+DTYPE = torch.double
 
 # -----------------------------------------------------------------------------
-# RL POLICY NETWORK – MUST MATCH TRAINING CODE
+# ENHANCED RL POLICY NETWORK
 # -----------------------------------------------------------------------------
 
 class PolicyNetwork(nn.Module):
     """Must match the PolicyNetwork used in training."""
 
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
         super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -85,89 +78,59 @@ class PolicyNetwork(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(action_dim))
 
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          action: (batch, action_dim)
-          log_prob: (batch,)
-        """
         h = self.shared(state)
         mean = self.mean_layer(h)
         std = torch.exp(self.log_std)
-        dist = torch.distributions.Normal(mean, std)
-        action = dist.rsample()
-        log_prob = dist.log_prob(action).sum(dim=-1)
-        return action, log_prob
+        return mean, std
 
 
 # -----------------------------------------------------------------------------
-# RL OPTIMIZER WRAPPER
+# ENHANCED RL OPTIMIZER WRAPPER
 # -----------------------------------------------------------------------------
 
-class RLOptimizer:
+class FullCocoRLOptimizer:
     """
-    Wraps a pre-trained policy and turns it into a 'suggest-next-point' optimizer.
-    This assumes:
-      - Action space during training was unconstrained, then clamped to [0, 1]^D.
-      - State representation is some summary of (X, y, c, step, budget).
+    Full COCO RL optimizer (trained on all COCO functions).
     """
 
     def __init__(self, dim: int, ckpt_path: Path):
         self.dim = dim
 
-        # Load the full checkpoint dict saved in train_rl.py
         ckpt = torch.load(ckpt_path, map_location=DEVICE)
-
-        # Use the state_dim that the policy was trained with
-        # (train_rl.py saved this as "state_dim")
         self.state_dim = int(ckpt.get("state_dim"))
-
-        # Extract hidden_dim from the checkpoint by inspecting the layer shapes
-        # The first layer weight has shape [hidden_dim, state_dim]
         hidden_dim = int(ckpt["policy_state_dict"]["shared.0.weight"].shape[0])
 
-        # Build the same architecture and load only the policy weights
         self.policy = PolicyNetwork(self.state_dim, dim, hidden_dim=hidden_dim).to(DEVICE)
         self.policy.load_state_dict(ckpt["policy_state_dict"])
         self.policy.eval()
 
     def _local_surrogate_features(self, X_hist: np.ndarray, f_hist: np.ndarray, c_hist: np.ndarray) -> np.ndarray:
-        """
-        Fit a tiny RBF ridge regression on recent points and return:
-          [mu_last, mu_best, residual_std]
-        If not enough data, returns zeros.
-        This MUST match train_rl_new.py for the policy to work correctly!
-        """
+        """RBF regression features."""
         n = len(X_hist)
         if n < 5:
             return np.zeros(3, dtype=np.float32)
 
         X = np.array(X_hist, dtype=np.float32)
-        y = -np.array(f_hist, dtype=np.float32)  # y = -f for maximization
+        y = -np.array(f_hist, dtype=np.float32)
 
-        # Use up to the last MAX_POINTS points for a local model
         MAX_POINTS = 50
         if n > MAX_POINTS:
             X = X[-MAX_POINTS:]
             y = y[-MAX_POINTS:]
 
-        # Choose a few RBF centers (here: 5) from these points
         MAX_CENTERS = min(5, len(X))
         centers = X[-MAX_CENTERS:]
 
-        # Compute RBF design matrix: K_ij = exp(-||x_i - c_j||^2 / (2*sigma^2))
         sigma = 0.2 * np.sqrt(self.dim)
         if sigma <= 0.0:
             return np.zeros(3, dtype=np.float32)
         denom = 2.0 * (sigma ** 2)
 
         def rbf_kernel(A, B):
-            # A: (n, d), B: (m, d)
             dists_sq = np.sum((A[:, None, :] - B[None, :, :]) ** 2, axis=-1)
             return np.exp(-dists_sq / denom)
 
-        K = rbf_kernel(X, centers)  # (n_points, n_centers)
-
-        # Ridge regression: y ~ K @ alpha
+        K = rbf_kernel(X, centers)
         lam = 1e-3
         KT_K = K.T @ K
         KT_y = K.T @ y
@@ -177,15 +140,12 @@ class RLOptimizer:
         except np.linalg.LinAlgError:
             return np.zeros(3, dtype=np.float32)
 
-        # Predictions on training points
         y_hat = K @ alpha
         residuals = y - y_hat
         residual_std = float(np.std(residuals))
 
-        # Predictions at last point and best feasible point
-        last_x = X[-1:, :]  # shape (1, d)
+        last_x = X[-1:, :]
 
-        # Best feasible point
         y_arr = -np.array(f_hist, dtype=np.float32)
         c_arr = np.array(c_hist, dtype=np.float32)
         feasible_mask = c_arr <= 0.0
@@ -212,15 +172,11 @@ class RLOptimizer:
             budget: int,
     ) -> np.ndarray:
         """
-        Build the state in the same way as CocoConstrainedBOEnv._get_state
-        in train_rl.py, so the RL policy sees identical features at test time.
-        Note: in training, y = -f (maximization), so we negate f_hist here.
+        ENHANCED state representation matching train_rl_enhanced.py.
         """
-        # If nothing has been observed yet, return zeros
         if len(X_hist) == 0:
             return np.zeros(self.state_dim, dtype=np.float32)
 
-        # In training: y_observed stores y = -f
         y_arr = -np.array(f_hist, dtype=np.float32)
         c_arr = np.array(c_hist, dtype=np.float32)
 
@@ -237,19 +193,28 @@ class RLOptimizer:
         n_feasible = int(np.sum(feasible_mask))
         feasible_ratio = float(n_feasible) / float(len(c_arr))
 
+        # ENHANCED: Constraint statistics
+        c_mean = float(np.mean(c_arr))
+        c_std = float(np.std(c_arr) + 1e-8)
+        c_min = float(np.min(c_arr))
+        last_c = float(c_arr[-1])
+
         last_point = X_hist[-1]
 
         if feasible_mask.any():
-            # argmax over feasible points
             best_idx = int(np.argmax(y_arr * feasible_mask))
             best_point = X_hist[best_idx]
+            best_c = float(c_arr[best_idx])
         else:
-            # Must match training: use zeros when no feasible point exists
-            # (changing this would cause distribution mismatch)
-            best_point = np.zeros_like(last_point)
+            # ENHANCED: Use least infeasible point
+            least_infeas_idx = int(np.argmin(c_arr))
+            best_point = X_hist[least_infeas_idx]
+            best_c = float(c_arr[least_infeas_idx])
 
         if np.isneginf(best_feasible):
             best_feasible = 0.0
+
+        progress = float(step) / float(budget)
 
         summary = np.array(
             [
@@ -260,21 +225,26 @@ class RLOptimizer:
                 float(n_feasible),
                 feasible_ratio,
                 float(len(X_hist)),
-                float(step),  # steps_taken in env
-                float(budget),  # horizon in env (we approximate with budget)
+                float(step),
+                float(budget),
                 float(self.dim),
+                c_mean,      # NEW
+                c_std,       # NEW
+                c_min,       # NEW
+                last_c,      # NEW
+                best_c,      # NEW
+                progress,    # NEW
             ],
             dtype=np.float32,
         )
 
-        # CRITICAL: Add surrogate features (missing in original benchmark_rl.py!)
         surrogate_feats = self._local_surrogate_features(X_hist, f_hist, c_hist)
 
         state = np.concatenate(
             [summary, surrogate_feats, last_point.astype(np.float32), best_point.astype(np.float32)]
         ).astype(np.float32)
 
-        # Safety: pad or truncate to self.state_dim in case of mismatch
+        # Safety
         if len(state) < self.state_dim:
             pad = np.zeros(self.state_dim - len(state), dtype=np.float32)
             state = np.concatenate([state, pad])
@@ -291,27 +261,24 @@ class RLOptimizer:
         step: int,
         budget: int,
     ) -> np.ndarray:
-        """
-        Returns a point in [0, 1]^dim (normalized space).
-        """
+        """Returns a point in [0, 1]^dim."""
         state = self._build_state(X_hist, f_hist, c_hist, step, budget)
         state_t = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
         with torch.no_grad():
             mean, std = self.policy(state_t)
 
-        # Use mean action (deterministic) at test time for stability
-        action = mean
+        action = mean  # deterministic at test time
 
-        # Map from R^d to [0,1]^d via tanh + rescale (MUST match training!)
+        # Map from R^d to [0,1]^d via tanh + rescale
         action = torch.tanh(action)
-        action = (action + 1.0) / 2.0  # [-1,1] -> [0,1]
+        action = (action + 1.0) / 2.0
         x_unit = action.clamp(0.0, 1.0).cpu().numpy()[0]
 
         return x_unit
 
 
 # -----------------------------------------------------------------------------
-# RANDOM SEARCH BASELINE
+# BASELINES (from benchmark_rl.py)
 # -----------------------------------------------------------------------------
 
 class RandomSearchOptimizer:
@@ -330,17 +297,8 @@ class RandomSearchOptimizer:
         return self.rng.random(self.dim)
 
 
-# -----------------------------------------------------------------------------
-# qLogEI BASELINE – BoTorch, constrained via aggregated constraint
-# -----------------------------------------------------------------------------
-
 class QLogEIOptimizer:
-    """
-    Implements a constrained qLogEI baseline using BoTorch, with q = 1 and
-    one aggregated constraint: c(x) = max_j g_j(x) from COCO.
-
-    Works in [0,1]^dim space; we map to COCO domain in the outer loop.
-    """
+    """qLogEI baseline with constrained optimization."""
 
     def __init__(self, dim: int):
         self.dim = dim
@@ -351,14 +309,11 @@ class QLogEIOptimizer:
         self.raw_samples = 128
 
     def _build_model(self, X_hist, f_hist, c_hist):
-        # X_hist: (n, d) in [0,1]^d
-        # Objective: we maximize -f (since BoTorch is maximization)
         train_x = torch.tensor(X_hist, dtype=self.dtype, device=self.device)
         train_obj = (-torch.tensor(f_hist, dtype=self.dtype, device=self.device)).unsqueeze(-1)
         train_con = torch.tensor(c_hist, dtype=self.dtype, device=self.device).unsqueeze(-1)
 
-        # Small observation noise to make GP numerically stable
-        NOISE_SE = 1e-2  # was 1e-3; a bit more noise for numerical stability
+        NOISE_SE = 1e-2
         train_yvar_obj = torch.full_like(train_obj, NOISE_SE ** 2)
         train_yvar_con = torch.full_like(train_con, NOISE_SE ** 2)
 
@@ -381,18 +336,13 @@ class QLogEIOptimizer:
         model = self._build_model(X_hist, f_hist, c_hist)
 
         def obj_callable(Z: torch.Tensor, X: torch.Tensor = None):
-            # output 0 is objective
             return Z[..., 0]
 
         def constraint_callable(Z: torch.Tensor):
-            # output 1 is aggregated constraint; feasible if <= 0
             return Z[..., 1]
 
         objective = GenericMCObjective(obj_callable)
-
-        sampler = SobolQMCNormalSampler(
-            sample_shape=torch.Size([self.mc_samples])
-        )
+        sampler = SobolQMCNormalSampler(sample_shape=torch.Size([self.mc_samples]))
 
         train_obj = (-torch.tensor(f_hist, dtype=self.dtype, device=self.device)).unsqueeze(-1)
         train_con = torch.tensor(c_hist, dtype=self.dtype, device=self.device).unsqueeze(-1)
@@ -401,7 +351,6 @@ class QLogEIOptimizer:
         if feas_mask.any():
             best_f = (train_obj * feas_mask).max()
         else:
-            # No feasible points yet – just treat best_f as current max
             best_f = train_obj.max()
 
         acq = qLogExpectedImprovement(
@@ -448,30 +397,17 @@ def map_unit_to_coco(x_unit: np.ndarray, problem) -> np.ndarray:
 
 
 def eval_coco(problem, x_unit: np.ndarray) -> Tuple[float, float, np.ndarray]:
-    """
-    Evaluate COCO problem at x_unit in [0,1]^d.
-
-    Returns:
-      f: objective (scalar)
-      c_agg: aggregated constraint (max over individual constraints, <= 0 => feasible)
-      x_real: point in original domain
-    """
     x_real = map_unit_to_coco(x_unit, problem)
-
-    # In bbob-constrained, problem(x) returns a scalar objective value
     f_val = problem(x_real)
     f = float(f_val)
 
-    # Constraints are provided separately via problem.constraint(x)
     if hasattr(problem, "constraint"):
         g_vals = np.asarray(problem.constraint(x_real), dtype=float)
         if g_vals.size == 0:
-            # No constraints returned – treat as unconstrained
             c_agg = 0.0
         else:
             c_agg = float(g_vals.max())
     else:
-        # Unconstrained problem – always feasible
         c_agg = 0.0
 
     return f, c_agg, x_real
@@ -486,15 +422,6 @@ def run_single_algorithm(
     n_init: int,
     rng: np.random.Generator,
 ) -> Dict[str, np.ndarray]:
-    """
-    Run one algorithm on one COCO problem.
-
-    Returns:
-      dict with history of:
-        - best_feasible_per_eval
-        - f_hist
-        - c_hist
-    """
     X_hist = []
     f_hist = []
     c_hist = []
@@ -551,28 +478,22 @@ def run_benchmarks():
         n_init = N_INIT_FACTOR * dim
         print(f"\n=== DIM = {dim}, budget = {budget}, n_init = {n_init} ===")
 
-        # RL model setup (you must set state_dim to what you used in training)
-        # If you are unsure, print(env.observation_space.shape[0]) from your
-        # training code and hard-code it here.
-        # As a safe default, we approximate: 6 summary scalars + dim last_x.
         rl_ckpt_path = MODEL_DIR / MODEL_PATTERN.format(dim=dim)
         if rl_ckpt_path.exists():
             rl_available = True
-            # We don’t need state_dim here; it’s loaded from the checkpoint
-            rl_optimizer_template = RLOptimizer(
+            rl_optimizer_template = FullCocoRLOptimizer(
                 dim=dim,
                 ckpt_path=rl_ckpt_path,
             )
+            print(f"[INFO] Loaded FULL COCO RL model: {rl_ckpt_path}")
         else:
             rl_available = False
-            print(f"[WARN] RL model not found for dim={dim}: {rl_ckpt_path}")
+            print(f"[WARN] FULL COCO RL model not found for dim={dim}: {rl_ckpt_path}")
 
         for fid in FUNCTIONS:
             for inst in INSTANCES:
-                coco_problem_id = f"bbob-constrained_f{fid}_i{inst}_d{dim}"
-                print(f"\nProblem F{fid}, instance {inst}, dim {dim}: {coco_problem_id}")
+                print(f"\nProblem F{fid}, instance {inst}, dim {dim}")
 
-                # COCO Python API: get problem by (function, dimension, instance)
                 problem = suite.get_problem_by_function_dimension_instance(
                     fid, dim, inst
                 )
@@ -580,8 +501,6 @@ def run_benchmarks():
                 for rep in range(REPETITIONS):
                     print(f"  Repetition {rep+1}/{REPETITIONS}...")
 
-                    # Use same seed for all algorithms to ensure fair comparison
-                    # (each gets same initial random points)
                     seed = 1234 + rep
 
                     # --- Random Search ---
@@ -635,17 +554,16 @@ def run_benchmarks():
                             )
                         )
 
-                    # --- RL (if available for this dim) ---
+                    # --- Full COCO RL (if available) ---
                     if rl_available:
-                        # New optimizer per run (stateless w.r.t. history)
-                        rl_opt = RLOptimizer(
+                        rl_opt = FullCocoRLOptimizer(
                             dim=dim,
                             ckpt_path=rl_ckpt_path,
                         )
                         rl_hist = run_single_algorithm(
                             problem=problem,
                             dim=dim,
-                            algo_name="RL",
+                            algo_name="RL_Full",
                             optimizer_obj=rl_opt,
                             budget=budget,
                             n_init=n_init,
@@ -655,7 +573,7 @@ def run_benchmarks():
                         for t, bf in enumerate(rl_hist["best_feasible"]):
                             results_rows.append(
                                 dict(
-                                    method="RL",
+                                    method="RL_Full",
                                     dim=dim,
                                     function=fid,
                                     instance=inst,
@@ -665,7 +583,7 @@ def run_benchmarks():
                                 )
                             )
 
-                    # ---- Per-repetition summary: final best feasible for each method ----
+                    # Summary
                     rs_final = float(rs_hist["best_feasible"][-1])
                     q_final = float(q_hist["best_feasible"][-1])
                     rl_final = None
@@ -673,19 +591,17 @@ def run_benchmarks():
                     if rl_available:
                         rl_final = float(rl_hist["best_feasible"][-1])
 
-                    # Print a concise comparison line
                     if rl_available:
                         print(
                             f"    Summary (dim={dim}, F{fid}, inst={inst}, rep={rep+1}): "
-                            f"Random={rs_final:.3e}, qLogEI={q_final:.3e}, RL={rl_final:.3e}"
+                            f"Random={rs_final:.3e}, qLogEI={q_final:.3e}, RL_Full={rl_final:.3e}"
                         )
                     else:
                         print(
                             f"    Summary (dim={dim}, F{fid}, inst={inst}, rep={rep+1}): "
-                            f"Random={rs_final:.3e}, qLogEI={q_final:.3e}, RL=N/A"
+                            f"Random={rs_final:.3e}, qLogEI={q_final:.3e}, RL_Full=N/A"
                         )
 
-                    # Store summary rows (one row per method per repetition)
                     summary_rows.append(
                         dict(
                             method="Random",
@@ -709,7 +625,7 @@ def run_benchmarks():
                     if rl_available:
                         summary_rows.append(
                             dict(
-                                method="RL",
+                                method="RL_Full",
                                 dim=dim,
                                 function=fid,
                                 instance=inst,
@@ -718,7 +634,6 @@ def run_benchmarks():
                             )
                         )
 
-                # optionally free problem resources
                 problem.free()
 
     df = pd.DataFrame(results_rows)
@@ -726,11 +641,9 @@ def run_benchmarks():
     df.to_csv(OUT_CSV, index=False)
     print(f"\nSaved benchmark results to: {OUT_CSV}")
 
-    # Per-repetition summary CSV
     summary_df = pd.DataFrame(summary_rows)
     summary_df.to_csv(OUT_CSV_SUMMARY, index=False)
     print(f"Saved per-repetition summary to: {OUT_CSV_SUMMARY}")
-
 
 
 if __name__ == "__main__":
